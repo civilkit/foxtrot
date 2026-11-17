@@ -63,7 +63,42 @@ fn transform_stack_roots<'a>(transform_stack: &TransformStack<'a>) -> Vec<Repres
         .collect()
 }
 
+/// One placed solid: its name, the product names from the assembly root down to it, and its triangles in the mesh.
+#[derive(Clone, Debug)]
+pub struct Body {
+    pub name: String,
+    pub path: Vec<String>,
+    pub tris: (usize, usize),
+}
+
+/// Representation id -> name of the product whose shape it is (SHAPE_DEFINITION_REPRESENTATION -> PRODUCT_DEFINITION_SHAPE
+/// -> PRODUCT_DEFINITION -> formation -> PRODUCT).
+fn representation_products(s: &StepFile) -> HashMap<usize, String> {
+    let mut out = HashMap::new();
+    for e in s.0.iter() {
+        if let Entity::ShapeDefinitionRepresentation(sdr) = e {
+            let pd = match &s[sdr.definition] { Entity::ProductDefinitionShape(p) => p.definition.0, _ => continue };
+            let formation = match &s.0[pd] { Entity::ProductDefinition(d) => d.formation.0, _ => continue };
+            let product = match &s.0[formation] {
+                Entity::ProductDefinitionFormation(f) => f.of_product.0,
+                Entity::ProductDefinitionFormationWithSpecifiedSource(f) => f.of_product.0,
+                _ => continue,
+            };
+            if let Entity::Product(p) = &s.0[product] {
+                out.insert(sdr.used_representation.0, p.name.0.to_string());
+            }
+        }
+    }
+    out
+}
+
 pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
+    let (m, st, _) = triangulate_bodies(s);
+    (m, st)
+}
+
+pub fn triangulate_bodies(s: &StepFile) -> (Mesh, Stats, Vec<Body>) {
+    let rep_product = representation_products(s);
     let styled_items: Vec<_> = s.0.iter()
         .filter_map(|e| MechanicalDesignGeometricPresentationRepresentation_::try_from_entity(e))
         .flat_map(|m| m.items.iter())
@@ -92,7 +127,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
         roots = transform_stack_roots(&transform_stack);
     }
     let mut todo: Vec<_> = roots.into_iter()
-        .map(|v| (v, DMat4::identity()))
+        .map(|v| (v, DMat4::identity(), Vec::<usize>::new()))
         .collect();
     if todo.len() > 1 {
         warn!("Transformation stack has more than one root!");
@@ -108,14 +143,16 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
         shape_rep_relationship.entry(r1).or_default().push(r2);
     }
 
-    let mut to_mesh: HashMap<Id<_>, Vec<_>> = HashMap::new();
-    while let Some((id, mat)) = todo.pop() {
+    let mut to_mesh: HashMap<Id<_>, Vec<(DMat4, Vec<usize>)>> = HashMap::new();
+    while let Some((id, mat, parent_path)) = todo.pop() {
+        let mut path = parent_path;
+        path.push(id.0);
         for child in shape_rep_relationship.get(&id).unwrap_or(&vec![]) {
-            todo.push((*child, mat));
+            todo.push((*child, mat, path.clone()));
         }
         if let Some(children) = transform_stack.get(&id) {
             for (child, next_mat) in children {
-                todo.push((*child, mat * next_mat));
+                todo.push((*child, mat * next_mat, path.clone()));
             }
         } else {
             // Bind this transform to the RepresentationItem, which is
@@ -132,7 +169,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                     Entity::ManifoldSolidBrep(_)
                     | Entity::BrepWithVoids(_)
                     | Entity::ShellBasedSurfaceModel(_) =>
-                        to_mesh.entry(*m).or_default().push(mat),
+                        to_mesh.entry(*m).or_default().push((mat, path.clone())),
                     Entity::Axis2Placement3d(_) => (),
                     e => warn!("Skipping {:?}", e),
                 }
@@ -153,14 +190,14 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                 }
             )
             .map(|(i, _e)| Id::new(i))
-            .for_each(|i| to_mesh.entry(i).or_default().push(DMat4::identity()));
+            .for_each(|i| to_mesh.entry(i).or_default().push((DMat4::identity(), vec![])));
     }
 
     let (to_mesh_iter, empty) = {
         #[cfg(feature = "rayon")]
-        { (to_mesh.par_iter(), || (Mesh::default(), Stats::default())) }
+        { (to_mesh.par_iter(), || (Mesh::default(), Stats::default(), Vec::<Body>::new())) }
         #[cfg(not(feature = "rayon"))]
-        { (to_mesh.iter(), (Mesh::default(), Stats::default())) }
+        { (to_mesh.iter(), (Mesh::default(), Stats::default(), Vec::<Body>::new())) }
     };
     let mesh_fold = to_mesh_iter
         .fold(
@@ -168,7 +205,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
             empty,
 
             // Fold operation
-            |(mut mesh, mut stats), (id, mats)| {
+            |(mut mesh, mut stats, mut bodies), (id, mats)| {
                 let v_start = mesh.verts.len();
                 let t_start = mesh.triangles.len();
                 match &s[*id] {
@@ -183,7 +220,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                         closed_shell(s, b.outer, &mut mesh, &mut stats),
                     _ => {
                         warn!("Skipping {:?} (not a known solid)", s[*id]);
-                        return (mesh, stats);
+                        return (mesh, stats, bodies);
                     },
                 };
 
@@ -196,7 +233,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                 // Build copies of the mesh by copying and applying transforms
                 let v_end = mesh.verts.len();
                 let t_end = mesh.triangles.len();
-                for mat in &mats[1..] {
+                for (mat, _) in &mats[1..] {
                     for v in v_start..v_end {
                         let p = mesh.verts[v].pos;
                         let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
@@ -217,7 +254,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
 
                 // Now that we've built all of the other copies of the mesh,
                 // re-use the original mesh and apply the first transform
-                let mat = mats[0];
+                let mat = mats[0].0;
                 for v in v_start..v_end {
                     let p = mesh.verts[v].pos;
                     let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
@@ -228,13 +265,36 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
 
                     mesh.verts[v].color = color;
                 }
-                (mesh, stats)
+                // one body per placement: the first is the original triangles, the others the copies appended after them
+                let name = match &s[*id] {
+                    Entity::ManifoldSolidBrep(b) => b.name.0,
+                    Entity::BrepWithVoids(b) => b.name.0,
+                    Entity::ShellBasedSurfaceModel(b) => b.name.0,
+                    _ => "",
+                }.to_string();
+                let n = t_end - t_start;
+                for (k, (_, rp)) in mats.iter().enumerate() {
+                    let tris = if k == 0 { (t_start, t_end) } else { (t_end + (k - 1) * n, t_end + k * n) };
+                    let mut path: Vec<String> = Vec::new();
+                    for r in rp {
+                        if let Some(nm) = rep_product.get(r) {
+                            if path.last() != Some(nm) { path.push(nm.clone()); }
+                        }
+                    }
+                    bodies.push(Body { name: name.clone(), path, tris });
+                }
+                (mesh, stats, bodies)
             });
 
-    let (mesh, stats) = {
+    let (mesh, stats, bodies) = {
         #[cfg(feature = "rayon")]
         { mesh_fold.reduce(empty,
-                |a, b| (Mesh::combine(a.0, b.0), Stats::combine(a.1, b.1))) }
+                |a, b| {
+                    let shift = a.0.triangles.len();
+                    let mut bodies = a.2;
+                    bodies.extend(b.2.into_iter().map(|mut x| { x.tris = (x.tris.0 + shift, x.tris.1 + shift); x }));
+                    (Mesh::combine(a.0, b.0), Stats::combine(a.1, b.1), bodies)
+                }) }
         #[cfg(not(feature = "rayon"))]
         {
             mesh_fold
@@ -245,7 +305,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     info!("num_faces: {}", stats.num_faces);
     info!("num_errors: {}", stats.num_errors);
     info!("num_panics: {}", stats.num_panics);
-    (mesh, stats)
+    (mesh, stats, bodies)
 }
 
 fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> DMat4 {

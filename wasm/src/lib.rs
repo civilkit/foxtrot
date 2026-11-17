@@ -63,6 +63,9 @@ pub struct Preview {
     faces: u32,
     errors: u32,
     panics: u32,
+    body_names: Vec<String>,
+    body_paths: Vec<String>,
+    body_tris: Vec<u32>,
 }
 
 #[wasm_bindgen]
@@ -73,6 +76,10 @@ impl Preview {
     #[wasm_bindgen(getter)] pub fn faces(&self) -> u32 { self.faces }
     #[wasm_bindgen(getter)] pub fn errors(&self) -> u32 { self.errors }
     #[wasm_bindgen(getter)] pub fn panics(&self) -> u32 { self.panics }
+    /// One entry per placed solid: its name, its product path (root first, names joined by U+001F) and its triangle range `[start, end)`.
+    #[wasm_bindgen(getter)] pub fn body_names(&self) -> Vec<String> { self.body_names.clone() }
+    #[wasm_bindgen(getter)] pub fn body_paths(&self) -> Vec<String> { self.body_paths.clone() }
+    #[wasm_bindgen(getter)] pub fn body_tris(&self) -> Vec<u32> { self.body_tris.clone() }
 }
 
 #[wasm_bindgen]
@@ -85,11 +92,11 @@ pub fn current_face() -> usize { triangulate::triangulate::guard::current() }
 #[wasm_bindgen]
 pub fn step_to_preview(data: &[u8]) -> Preview {
     use step::step_file::StepFile;
-    use triangulate::triangulate::triangulate;
+    use triangulate::triangulate::triangulate_bodies;
 
     let flat = StepFile::strip_flatten(data);
     let step = StepFile::parse(&flat);
-    let (mesh, stats) = triangulate(&step);
+    let (mesh, stats, bodies) = triangulate_bodies(&step);
     let n = mesh.triangles.len();
     let (mut positions, mut normals) = (Vec::with_capacity(n * 9), Vec::with_capacity(n * 9));
     for t in &mesh.triangles {
@@ -99,5 +106,8 @@ pub fn step_to_preview(data: &[u8]) -> Preview {
             normals.extend(v.norm.iter().map(|&f| f as f32));
         }
     }
-    Preview { positions, normals, shells: stats.num_shells as u32, faces: stats.num_faces as u32, errors: stats.num_errors as u32, panics: stats.num_panics as u32 }
+    let body_names = bodies.iter().map(|b| b.name.clone()).collect();
+    let body_paths = bodies.iter().map(|b| b.path.join("\u{1f}")).collect();
+    let body_tris = bodies.iter().flat_map(|b| [b.tris.0 as u32, b.tris.1 as u32]).collect();
+    Preview { body_names, body_paths, body_tris, positions, normals, shells: stats.num_shells as u32, faces: stats.num_faces as u32, errors: stats.num_errors as u32, panics: stats.num_panics as u32 }
 }

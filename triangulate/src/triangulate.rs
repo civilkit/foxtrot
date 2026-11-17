@@ -430,6 +430,13 @@ fn advanced_face(s: &StepFile, f: AdvancedFace, mesh: &mut Mesh,
     let mut pts = surf.lower_verts(&mut mesh.verts[v_start..])?;
     let bonus_points = pts.len();
     surf.add_steiner_points(&mut pts, &mut mesh.verts);
+    // wasm32 cannot unwind: a panic is a trap.  The host records which face was
+    // running (`guard::current`), and on a trap re-runs with that face skipped.
+    guard::set_current(face.face_geometry.0);
+    if guard::skipped(face.face_geometry.0) {
+        stats.num_panics += 1;
+        return Ok(());
+    }
     let result = std::panic::catch_unwind(|| {
         // TODO: this is only needed because we use pts below to save a debug
         // SVG if this panics.  Once we're confident in never panicking, we
@@ -778,4 +785,16 @@ fn vertex_point(s: &StepFile, v: Vertex) -> DVec3 {
             .expect("Could not get VertexPoint")
             .vertex_geometry
             .cast())
+}
+
+/// Faces that trap on targets where a panic cannot be caught (wasm32), and the face being meshed when one did.
+pub mod guard {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    static CURRENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static SKIP: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    pub fn set_current(id: usize) { CURRENT.store(id, Ordering::Relaxed); }
+    pub fn current() -> usize { CURRENT.load(Ordering::Relaxed) }
+    pub fn skip(id: usize) { SKIP.lock().unwrap().push(id); }
+    pub fn skipped(id: usize) -> bool { let s = SKIP.lock().unwrap(); !s.is_empty() && s.contains(&id) }
 }
